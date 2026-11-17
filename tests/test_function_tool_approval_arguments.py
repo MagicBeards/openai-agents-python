@@ -751,7 +751,10 @@ def pydantic_plugin_events(monkeypatch):
 
     class Plugin:
         def new_schema_validator(self, schema, schema_type, path, kind, config, settings):
-            return (Handler(), None, None) if path.name == "operation_args" else (None, None, None)
+            # Tool arguments are validated as JSON, so the JSON-mode handler observes them.
+            if path.name == "operation_args":
+                return (None, Handler(), None)
+            return (None, None, None)
 
     # Use Pydantic's real plugin wrapper around the generated tool model.
     monkeypatch.setattr("pydantic.plugin._loader.get_plugins", lambda: [Plugin()])

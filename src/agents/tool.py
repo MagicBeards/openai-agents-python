@@ -2779,14 +2779,17 @@ def function_tool(
             input: str, tool_name: str, *, inspect_approval: bool = False
         ) -> PreparedFunctionArguments:
             json_data = _parse_function_tool_json_input(tool_name=tool_name, input_json=input)
-            # Keep mutable policy input separate from prepared execution values.
-            validation_input = copy.deepcopy(json_data) if inspect_approval else json_data
             base_message = f"Invalid JSON input for tool {tool_name}"
             validation_failed = False
             try:
+                # Arguments only ever arrive as JSON, so validate them in JSON mode. Pydantic
+                # applies a strict field's JSON representation in that mode (a string for `date`,
+                # `datetime`, `UUID`, or `Enum`; an array for `tuple`), which is exactly what the
+                # tool's params_json_schema advertises, while Python mode rejects those values.
+                # The raw string is validated, so policy input is never mutated.
                 parsed = (
-                    schema.params_pydantic_model(**validation_input)
-                    if validation_input
+                    schema.params_pydantic_model.model_validate_json(input)
+                    if json_data
                     else schema.params_pydantic_model()
                 )
             except ValidationError as e:

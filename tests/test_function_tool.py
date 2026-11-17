@@ -6,11 +6,14 @@ import json
 import logging
 import time
 from collections.abc import Callable
+from datetime import date, datetime, timezone
+from enum import Enum
 from typing import Annotated, Any, cast
+from uuid import UUID
 
 import pytest
 from jsonschema import Draft202012Validator
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from typing_extensions import TypedDict
 
 import agents._debug as _debug
@@ -1762,3 +1765,102 @@ async def test_kwargs_key_colliding_with_param_is_reported_as_model_behavior_err
         )
 
     assert "'x'" in str(exc_info.value)
+
+
+class StrictColor(Enum):
+    RED = "red"
+    BLUE = "blue"
+
+
+class StrictWindow(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    due: date
+    identifier: UUID
+
+
+def strict_parameter_function(
+    color: Annotated[StrictColor, Field(strict=True)],
+    due: Annotated[date, Field(strict=True)],
+    at: Annotated[datetime, Field(strict=True)],
+    identifier: Annotated[UUID, Field(strict=True)],
+    point: Annotated[tuple[int, int], Field(strict=True)],
+    count: Annotated[int, Field(strict=True)],
+    window: StrictWindow,
+) -> dict[str, Any]:
+    return {
+        "color": color,
+        "due": due,
+        "at": at,
+        "identifier": identifier,
+        "point": point,
+        "count": count,
+        "window": window,
+    }
+
+
+def strict_parameter_arguments() -> dict[str, Any]:
+    return {
+        "color": "red",
+        "due": "2024-01-02",
+        "at": "2024-01-02T03:04:05Z",
+        "identifier": "12345678-1234-5678-1234-567812345678",
+        "point": [1, 2],
+        "count": 3,
+        "window": {"due": "2024-02-03", "identifier": "87654321-4321-8765-4321-876543218765"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_strict_parameter_types_accept_json_arguments():
+    """Strict parameters must accept the JSON values their own params_json_schema advertises.
+
+    Pydantic strict mode is input-format aware: a JSON string is the strict representation of a
+    ``date``/``datetime``/``UUID``/``Enum`` and a JSON array is the strict representation of a
+    ``tuple``. Tool arguments only ever arrive as JSON, so validating them as Python values
+    rejected every argument the schema itself promised the model.
+    """
+    tool = function_tool(strict_parameter_function, failure_error_function=None)
+    arguments = json.dumps(strict_parameter_arguments())
+
+    received = await tool.on_invoke_tool(
+        ToolContext(None, tool_name=tool.name, tool_call_id="1", tool_arguments=arguments),
+        arguments,
+    )
+
+    assert received == {
+        "color": StrictColor.RED,
+        "due": date(2024, 1, 2),
+        "at": datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
+        "identifier": UUID("12345678-1234-5678-1234-567812345678"),
+        "point": (1, 2),
+        "count": 3,
+        "window": StrictWindow(
+            due=date(2024, 2, 3), identifier=UUID("87654321-4321-8765-4321-876543218765")
+        ),
+    }
+
+    # The strict setting still governs every other use of the same model.
+    with pytest.raises(ValidationError):
+        StrictWindow(due="2024-02-03", identifier="87654321-4321-8765-4321-876543218765")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"count": "3"},
+        {"window": {"due": 20240102, "identifier": "87654321-4321-8765-4321-876543218765"}},
+    ],
+    ids=["strict-int-rejects-json-string", "nested-strict-date-rejects-int"],
+)
+async def test_strict_parameter_types_still_reject_non_json_values(overrides):
+    """JSON-mode strictness still rejects the values strict mode exists to reject."""
+    tool = function_tool(strict_parameter_function, failure_error_function=None)
+    arguments = json.dumps({**strict_parameter_arguments(), **overrides})
+
+    with pytest.raises(ModelBehaviorError, match="Invalid JSON input for tool"):
+        await tool.on_invoke_tool(
+            ToolContext(None, tool_name=tool.name, tool_call_id="1", tool_arguments=arguments),
+            arguments,
+        )
