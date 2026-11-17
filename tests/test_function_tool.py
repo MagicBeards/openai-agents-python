@@ -1821,11 +1821,14 @@ async def test_strict_parameter_types_accept_json_arguments():
     rejected every argument the schema itself promised the model.
     """
     tool = function_tool(strict_parameter_function, failure_error_function=None)
-    arguments = json.dumps(strict_parameter_arguments())
+    arguments = strict_parameter_arguments()
+    # The tool advertises exactly these values, so its own schema has to accept them.
+    assert Draft202012Validator(tool.params_json_schema).is_valid(arguments)
+    input_json = json.dumps(arguments)
 
     received = await tool.on_invoke_tool(
-        ToolContext(None, tool_name=tool.name, tool_call_id="1", tool_arguments=arguments),
-        arguments,
+        ToolContext(None, tool_name=tool.name, tool_call_id="1", tool_arguments=input_json),
+        input_json,
     )
 
     assert received == {
