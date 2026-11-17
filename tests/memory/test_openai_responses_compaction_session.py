@@ -167,6 +167,18 @@ async def test_limited_underlying_store_does_not_replay_orphan_function_call_out
         underlying.close()
 
 
+def test_session_settings_assignment_reaches_underlying_store() -> None:
+    # The wrapped store owns the history and its retrieval window, so the wrapper must not
+    # keep a second copy of these settings: that divergence is what hid the store's limit.
+    underlying = SimpleListSession()
+    session = OpenAIResponsesCompactionSession("settings", underlying)
+
+    session.session_settings = SessionSettings(limit=1)
+
+    assert underlying.session_settings == SessionSettings(limit=1)
+    assert session.session_settings is underlying.session_settings
+
+
 class TestIsOpenAIModelName:
     def test_gpt_models(self) -> None:
         assert is_openai_model_name("gpt-4o") is True
