@@ -975,6 +975,270 @@ class TestGuardrailFunctionality:
         assert len(session._item_transcripts) == 0
         assert len(session._item_guardrail_run_counts) == 0
 
+    def _recording_guardrail(self, name: str, checked: list[tuple[str, str]]) -> OutputGuardrail:
+        """Create a guardrail that records the agent name and text it inspected."""
+
+        async def guardrail_func(context, agent, output):
+            _ = context
+            checked.append((agent.name, output))
+            return GuardrailFunctionOutput(output_info={}, tripwire_triggered=False)
+
+        return OutputGuardrail(guardrail_function=guardrail_func, name=name)
+
+    @pytest.mark.asyncio
+    async def test_turn_ended_checks_reply_shorter_than_debounce_threshold(
+        self, mock_model, mock_agent
+    ):
+        """A reply that never crosses a debounce boundary is still checked when the turn ends."""
+        checked: list[tuple[str, str]] = []
+        session = RealtimeSession(
+            mock_model,
+            mock_agent,
+            None,
+            run_config={
+                "output_guardrails": [self._recording_guardrail("recording_guardrail", checked)],
+                "guardrails_settings": {"debounce_text_length": 20},
+            },
+        )
+
+        await session.on_event(RealtimeModelTurnStartedEvent(response_id="resp_1"))
+        await session.on_event(
+            RealtimeModelTranscriptDeltaEvent(
+                item_id="item_1", delta="short reply", response_id="resp_1"
+            )
+        )
+        await self._wait_for_guardrail_tasks(session)
+        assert checked == []
+
+        await session.on_event(RealtimeModelTurnEndedEvent(response_id="resp_1"))
+        await self._wait_for_guardrail_tasks(session)
+
+        assert checked == [("test_agent", "short reply")]
+
+    @pytest.mark.asyncio
+    async def test_turn_ended_checks_text_after_last_crossed_boundary(self, mock_model, mock_agent):
+        """Text appended after the last crossed boundary is checked when the turn ends."""
+        checked: list[tuple[str, str]] = []
+        session = RealtimeSession(
+            mock_model,
+            mock_agent,
+            None,
+            run_config={
+                "output_guardrails": [self._recording_guardrail("recording_guardrail", checked)],
+                "guardrails_settings": {"debounce_text_length": 5},
+            },
+        )
+
+        await session.on_event(RealtimeModelTurnStartedEvent(response_id="resp_1"))
+        await session.on_event(
+            RealtimeModelTranscriptDeltaEvent(item_id="item_1", delta="12345", response_id="resp_1")
+        )
+        await self._wait_for_guardrail_tasks(session)
+        assert checked == [("test_agent", "12345")]
+
+        await session.on_event(
+            RealtimeModelTranscriptDeltaEvent(item_id="item_1", delta="6789", response_id="resp_1")
+        )
+        await self._wait_for_guardrail_tasks(session)
+        assert checked == [("test_agent", "12345")]
+
+        await session.on_event(RealtimeModelTurnEndedEvent(response_id="resp_1"))
+        await self._wait_for_guardrail_tasks(session)
+
+        assert checked == [("test_agent", "12345"), ("test_agent", "123456789")]
+
+    @pytest.mark.asyncio
+    async def test_turn_ended_does_not_recheck_already_inspected_text(self, mock_model, mock_agent):
+        """Ending a turn right after a debounced run does not inspect the same text twice."""
+        checked: list[tuple[str, str]] = []
+        session = RealtimeSession(
+            mock_model,
+            mock_agent,
+            None,
+            run_config={
+                "output_guardrails": [self._recording_guardrail("recording_guardrail", checked)],
+                "guardrails_settings": {"debounce_text_length": 5},
+            },
+        )
+
+        await session.on_event(RealtimeModelTurnStartedEvent(response_id="resp_1"))
+        await session.on_event(
+            RealtimeModelTranscriptDeltaEvent(
+                item_id="item_1", delta="123456", response_id="resp_1"
+            )
+        )
+        await self._wait_for_guardrail_tasks(session)
+        assert checked == [("test_agent", "123456")]
+
+        await session.on_event(RealtimeModelTurnEndedEvent(response_id="resp_1"))
+        await self._wait_for_guardrail_tasks(session)
+
+        assert checked == [("test_agent", "123456")]
+
+    @pytest.mark.asyncio
+    async def test_turn_ended_checks_with_the_agent_that_produced_the_turn(self, mock_model):
+        """The final check uses the turn's agent, not an agent that took over mid-turn."""
+        checked: list[tuple[str, str]] = []
+        source_agent = RealtimeAgent(
+            name="source",
+            output_guardrails=[self._recording_guardrail("source_guardrail", checked)],
+        )
+        other_agent = RealtimeAgent(
+            name="other", output_guardrails=[self._recording_guardrail("other_guardrail", checked)]
+        )
+        session = RealtimeSession(
+            mock_model,
+            source_agent,
+            None,
+            run_config={"guardrails_settings": {"debounce_text_length": 20}},
+        )
+
+        await session.on_event(RealtimeModelTurnStartedEvent(response_id="resp_1"))
+        await session.on_event(
+            RealtimeModelTranscriptDeltaEvent(
+                item_id="item_1", delta="short reply", response_id="resp_1"
+            )
+        )
+        await session.update_agent(other_agent)
+
+        await session.on_event(RealtimeModelTurnEndedEvent(response_id="resp_1"))
+        await self._wait_for_guardrail_tasks(session)
+
+        assert checked == [("source", "short reply")]
+
+    @pytest.mark.asyncio
+    async def test_turn_ended_tail_check_still_interrupts_response_playback(self, mock_agent):
+        """The final check completes before audio is retired, so a trip can stop playback."""
+        guardrail_started = asyncio.Event()
+        release_guardrail = asyncio.Event()
+
+        async def delayed_guardrail(context, agent, output):
+            _ = context, agent, output
+            guardrail_started.set()
+            await release_guardrail.wait()
+            return GuardrailFunctionOutput(output_info={}, tripwire_triggered=True)
+
+        model = RecordingRealtimeModel()
+        session = RealtimeSession(
+            model,
+            RealtimeAgent(
+                name="source",
+                output_guardrails=[
+                    OutputGuardrail(guardrail_function=delayed_guardrail, name="delayed_guardrail")
+                ],
+            ),
+            None,
+            run_config={"guardrails_settings": {"debounce_text_length": 20}},
+        )
+
+        await session.on_event(RealtimeModelTurnStartedEvent(response_id="resp_1"))
+        await session.on_event(
+            RealtimeModelTranscriptDeltaEvent(
+                item_id="item_1", delta="short reply", response_id="resp_1"
+            )
+        )
+        await session.on_event(RealtimeModelTurnEndedEvent(response_id="resp_1"))
+        await guardrail_started.wait()
+
+        assert model.retired_audio_response_ids == []
+
+        release_guardrail.set()
+        await self._wait_for_guardrail_tasks(session)
+
+        assert model.retired_audio_response_ids == ["resp_1"]
+        interrupts = [
+            event for event in model.sent_events if isinstance(event, RealtimeModelSendInterrupt)
+        ]
+        assert len(interrupts) == 1
+        # The turn has already ended when the tail check trips, so the interrupt only stops
+        # local playback instead of cancelling the completed response.
+        assert interrupts[0].response_id == "resp_1"
+        assert interrupts[0].force_response_cancel is False
+        assert interrupts[0].cancel_response_only is False
+        assert interrupts[0].playback_only is True
+
+    @pytest.mark.asyncio
+    async def test_turn_ended_checks_output_text_without_interrupting_playback(
+        self, mock_model, mock_agent, triggered_guardrail
+    ):
+        """A tripping text tail reports the trip without claiming any audio must stop."""
+        session = RealtimeSession(
+            mock_model,
+            mock_agent,
+            None,
+            run_config={
+                "output_guardrails": [triggered_guardrail],
+                "guardrails_settings": {"debounce_text_length": 20},
+            },
+        )
+
+        await session.on_event(RealtimeModelTurnStartedEvent(response_id="resp_1"))
+        await session.on_event(
+            RealtimeModelOutputTextDeltaEvent(
+                item_id="item_1", delta="short reply", response_id="resp_1"
+            )
+        )
+        await self._wait_for_guardrail_tasks(session)
+        assert mock_model.interrupts_called == 0
+
+        await session.on_event(RealtimeModelTurnEndedEvent(response_id="resp_1"))
+        await self._wait_for_guardrail_tasks(session)
+
+        assert mock_model.sent_messages == ["guardrail triggered: triggered_guardrail"]
+        assert not any(
+            isinstance(event, RealtimeModelSendInterrupt) for event in mock_model.sent_events
+        )
+        queued_events = []
+        while not session._event_queue.empty():
+            queued_events.append(await session._event_queue.get())
+        assert sum(isinstance(event, RealtimeGuardrailTripped) for event in queued_events) == 1
+
+    @pytest.mark.asyncio
+    async def test_stale_output_text_tail_check_does_not_affect_newer_response(self, mock_model):
+        """A text tail that trips after a newer turn started sends no interrupt and no feedback."""
+        guardrail_started = asyncio.Event()
+        release_guardrail = asyncio.Event()
+
+        async def delayed_guardrail(context, agent, output):
+            _ = context, agent, output
+            guardrail_started.set()
+            await release_guardrail.wait()
+            return GuardrailFunctionOutput(output_info={}, tripwire_triggered=True)
+
+        session = RealtimeSession(
+            mock_model,
+            RealtimeAgent(
+                name="source",
+                output_guardrails=[
+                    OutputGuardrail(guardrail_function=delayed_guardrail, name="delayed_guardrail")
+                ],
+            ),
+            None,
+            run_config={"guardrails_settings": {"debounce_text_length": 20}},
+        )
+
+        await session.on_event(RealtimeModelTurnStartedEvent(response_id="resp_1"))
+        await session.on_event(
+            RealtimeModelOutputTextDeltaEvent(
+                item_id="item_1", delta="short reply", response_id="resp_1"
+            )
+        )
+        await session.on_event(RealtimeModelTurnEndedEvent(response_id="resp_1"))
+        await guardrail_started.wait()
+
+        await session.on_event(RealtimeModelTurnStartedEvent(response_id="resp_2"))
+        release_guardrail.set()
+        await self._wait_for_guardrail_tasks(session)
+
+        assert not any(
+            isinstance(event, RealtimeModelSendInterrupt) for event in mock_model.sent_events
+        )
+        assert mock_model.sent_messages == []
+        queued_events = []
+        while not session._event_queue.empty():
+            queued_events.append(await session._event_queue.get())
+        assert sum(isinstance(event, RealtimeGuardrailTripped) for event in queued_events) == 1
+
     @pytest.mark.asyncio
     async def test_multiple_guardrails_all_triggered(self, mock_model, mock_agent):
         """Test that all triggered guardrails are included in the event"""

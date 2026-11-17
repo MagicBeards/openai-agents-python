@@ -246,6 +246,8 @@ class RealtimeSession(RealtimeModelListener):
         self._interrupted_response_ids: set[str] = set()
         self._item_transcripts: dict[str, str] = {}  # item_id -> accumulated transcript
         self._item_guardrail_run_counts: dict[str, int] = {}  # item_id -> run count
+        self._item_guardrail_checked_lengths: dict[str, int] = {}  # item_id -> inspected length
+        self._item_guardrail_audio_items: dict[str, bool] = {}  # item_id -> is audio output
         self._latest_output_response_generation = 0
         self._active_output_response_generation: int | None = None
         self._active_output_response_id: str | None = None
@@ -613,12 +615,17 @@ class RealtimeSession(RealtimeModelListener):
             self._context_wrapper.usage.add(event.usage)
         elif event.type == "turn_ended":
             response_id = event.response_id or self._active_output_response_id
-            if response_id is not None:
-                self._finish_response_guardrail_lifecycle(response_id)
-
             is_active_response_ended = (
                 event.response_id is None or event.response_id == self._active_output_response_id
             )
+            if is_active_response_ended and response_id is not None:
+                # Debounced runs stop at the last crossed threshold, so the remaining tail is
+                # inspected here. This has to happen before the guardrail lifecycle settles, or
+                # a tripping tail can no longer interrupt this response's playback.
+                self._run_output_guardrails_for_unchecked_text(response_id)
+            if response_id is not None:
+                self._finish_response_guardrail_lifecycle(response_id)
+
             if is_active_response_ended:
                 # A handoff inside the response has already moved _current_agent to the
                 # new agent, so the agent that produced this turn is the one captured at
@@ -628,6 +635,8 @@ class RealtimeSession(RealtimeModelListener):
                 # Clear guardrail state for next turn.
                 self._item_transcripts.clear()
                 self._item_guardrail_run_counts.clear()
+                self._item_guardrail_checked_lengths.clear()
+                self._item_guardrail_audio_items.clear()
                 self._active_output_response_generation = None
                 self._active_output_response_id = None
                 self._active_output_response_agent = None
@@ -1819,6 +1828,7 @@ class RealtimeSession(RealtimeModelListener):
             self._item_guardrail_run_counts[item_id] = 0
 
         self._item_transcripts[item_id] += delta
+        self._item_guardrail_audio_items[item_id] = is_audio_output
         current_length = len(self._item_transcripts[item_id])
         threshold = self._debounce_text_length
         next_run_threshold = (self._item_guardrail_run_counts[item_id] + 1) * threshold
@@ -1828,12 +1838,27 @@ class RealtimeSession(RealtimeModelListener):
             self._item_guardrail_run_counts[item_id] = max(
                 self._item_guardrail_run_counts[item_id] + 1, crossed_thresholds
             )
+            self._item_guardrail_checked_lengths[item_id] = current_length
             self._enqueue_guardrail_task(
                 self._item_transcripts[item_id],
                 response_id,
                 agent_snapshot=agent_snapshot,
                 output_response_generation=output_response_generation,
                 is_audio_output=is_audio_output,
+            )
+
+    def _run_output_guardrails_for_unchecked_text(self, response_id: str) -> None:
+        """Run output guardrails on accumulated text that no debounced run has inspected yet."""
+        for item_id, transcript in self._item_transcripts.items():
+            if len(transcript) <= self._item_guardrail_checked_lengths.get(item_id, 0):
+                continue
+            self._item_guardrail_checked_lengths[item_id] = len(transcript)
+            self._enqueue_guardrail_task(
+                transcript,
+                response_id,
+                agent_snapshot=self._active_output_response_agent,
+                output_response_generation=self._active_output_response_generation,
+                is_audio_output=self._item_guardrail_audio_items[item_id],
             )
 
     def _enqueue_guardrail_task(
@@ -2037,6 +2062,8 @@ class RealtimeSession(RealtimeModelListener):
         self._active_output_response_agent = None
         self._item_transcripts.clear()
         self._item_guardrail_run_counts.clear()
+        self._item_guardrail_checked_lengths.clear()
+        self._item_guardrail_audio_items.clear()
         self._guardrail_tasks_by_response_id.clear()
         self._responses_awaiting_guardrail_cleanup.clear()
 

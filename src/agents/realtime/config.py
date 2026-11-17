@@ -252,7 +252,7 @@ class RealtimeGuardrailsSettings(TypedDict):
     """
     The minimum number of characters to accumulate before running guardrails on output text or
     transcript deltas. Defaults to 100. Guardrails run every time the accumulated text reaches
-    1x, 2x, 3x, etc. times this threshold.
+    1x, 2x, 3x, etc. times this threshold, and once more on any remaining text when the turn ends.
     """
 
 
