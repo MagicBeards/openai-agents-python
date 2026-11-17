@@ -977,10 +977,10 @@ class AnyLLMModel(Model):
                 )
             return normalized_response
 
-        responses_tool_choice = OpenAIResponsesConverter.convert_tool_choice(
+        responses_tool_choice = Converter.convert_tool_choice_to_response_param(
             model_settings.tool_choice
         )
-        if responses_tool_choice is None or responses_tool_choice is omit:
+        if responses_tool_choice is omit:
             responses_tool_choice = "auto"
 
         response = Response(

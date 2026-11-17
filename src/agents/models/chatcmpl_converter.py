@@ -16,6 +16,7 @@ from openai.types.chat import (
     ChatCompletionMessage,
     ChatCompletionMessageFunctionToolCallParam,
     ChatCompletionMessageParam,
+    ChatCompletionNamedToolChoiceParam,
     ChatCompletionSystemMessageParam,
     ChatCompletionToolChoiceOptionParam,
     ChatCompletionToolMessageParam,
@@ -40,12 +41,14 @@ from openai.types.responses import (
     ResponseOutputText,
     ResponseReasoningItem,
     ResponseReasoningItemParam,
+    response_create_params,
 )
 from openai.types.responses.response_input_param import FunctionCallOutput, ItemReference, Message
 from openai.types.responses.response_output_text import (
     Annotation as ResponseOutputTextAnnotation,
 )
 from openai.types.responses.response_reasoning_item import Content, Summary
+from openai.types.responses.tool_choice_function_param import ToolChoiceFunctionParam
 
 from ..agent_output import AgentOutputSchemaBase
 from ..exceptions import AgentsException, UserError
@@ -102,6 +105,28 @@ class Converter:
                     "name": tool_choice,
                 },
             }
+
+    @classmethod
+    def convert_tool_choice_to_response_param(
+        cls, tool_choice: Literal["auto", "required", "none"] | str | MCPToolChoice | None
+    ) -> response_create_params.ToolChoice | Omit:
+        """Convert a tool choice into the placeholder `Response` tool choice.
+
+        Chat Completions has no hosted tool selectors, so a named `tool_choice` is always a
+        function tool. Resolving the name with the Responses converter instead reads names such
+        as `web_search` or `mcp` as hosted tools, which the `Response` placeholder cannot hold.
+        """
+        converted = cls.convert_tool_choice(tool_choice)
+        if converted is omit:
+            return omit
+        if isinstance(converted, dict):
+            named_choice = cast(ChatCompletionNamedToolChoiceParam, converted)
+            function_choice: ToolChoiceFunctionParam = {
+                "type": "function",
+                "name": named_choice["function"]["name"],
+            }
+            return function_choice
+        return converted
 
     @classmethod
     def convert_response_format(

@@ -4551,3 +4551,72 @@ async def test_streamed_span_counts_request_on_length_truncation_without_usage(
     assert generation.span_data.usage is not None
     assert generation.span_data.usage["requests"] == 1
     assert generation.span_data.usage["total_tokens"] == 0
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name",
+    ["web_search", "mcp", "web_search_preview", "file_search"],
+)
+async def test_streamed_run_keeps_function_tool_choice_names_out_of_hosted_selectors(
+    tool_name: str,
+) -> None:
+    """A function tool named like a hosted tool must stay a function tool choice.
+
+    The streamed Chat Completions placeholder `Response` resolved `tool_choice` with the
+    Responses converter, which selects a hosted tool for those names instead of the function
+    tool the request itself asks for.
+    """
+    chunk = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="gpt-5.4-mini",
+        object="chat.completion.chunk",
+        choices=[
+            Choice(
+                index=0,
+                delta=ChoiceDelta(role="assistant", content="ok"),
+                finish_reason="stop",
+            )
+        ],
+    )
+
+    class DummyCompletions:
+        def __init__(self) -> None:
+            self.kwargs: dict[str, Any] = {}
+
+        async def create(self, **kwargs: Any) -> AsyncIterator[ChatCompletionChunk]:
+            self.kwargs = kwargs
+            return _completion_stream(chunk)
+
+    class DummyClient:
+        def __init__(self, completions: DummyCompletions) -> None:
+            self.chat = type("_Chat", (), {"completions": completions})()
+            self.base_url = httpx2.URL("https://api.openai.com/v1/")
+
+    completions = DummyCompletions()
+    model = OpenAIChatCompletionsModel(
+        model="gpt-5.4-mini", openai_client=cast(Any, DummyClient(completions))
+    )
+    agent = Agent(
+        name="test",
+        model=model,
+        tools=[function_tool(lambda: "ok", name_override=tool_name)],
+        model_settings=ModelSettings(tool_choice=tool_name),
+    )
+
+    completed: ResponseCompletedEvent | None = None
+    async for event in Runner.run_streamed(agent, "hi").stream_events():
+        data = getattr(event, "data", None)
+        if isinstance(data, ResponseCompletedEvent):
+            completed = data
+
+    assert completed is not None
+    request_tool_choice = completions.kwargs["tool_choice"]
+    assert request_tool_choice == {"type": "function", "function": {"name": tool_name}}
+    # The placeholder must describe the same tool choice the request asked for.
+    assert cast(Any, completed.response.tool_choice).model_dump() == {
+        "type": "function",
+        "name": request_tool_choice["function"]["name"],
+    }

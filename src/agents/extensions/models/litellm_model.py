@@ -56,7 +56,6 @@ from ...models.chatcmpl_stream_handler import ChatCmplStreamHandler
 from ...models.default_models import get_default_model_settings
 from ...models.fake_id import FAKE_RESPONSES_ID
 from ...models.interface import Model, ModelTracing
-from ...models.openai_responses import Converter as OpenAIResponsesConverter
 from ...models.reasoning_content_replay import ShouldReplayReasoningContent
 from ...retry import ModelRetryAdvice, ModelRetryAdviceRequest
 from ...tool import Tool
@@ -664,10 +663,10 @@ class LitellmModel(Model):
         if isinstance(ret, litellm.types.utils.ModelResponse):
             return ret
 
-        responses_tool_choice = OpenAIResponsesConverter.convert_tool_choice(
+        responses_tool_choice = Converter.convert_tool_choice_to_response_param(
             model_settings.tool_choice
         )
-        if responses_tool_choice is None or responses_tool_choice is omit:
+        if responses_tool_choice is omit:
             responses_tool_choice = "auto"
 
         response = Response(
