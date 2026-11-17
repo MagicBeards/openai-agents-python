@@ -498,7 +498,7 @@ async def prepare_input_with_session(
             if session_input_callback is None and resolved_settings.limit is not None:
                 output_pruning_indexes = set(prune_history_indexes)
                 if len(converted_history) == resolved_settings.limit:
-                    _omit_boundary_assistant_message_ids(converted_history)
+                    _replay_boundary_response_fragment_by_value(converted_history)
     else:
         if not callable(session_input_callback):
             raise UserError(
@@ -1839,16 +1839,35 @@ def _is_unpersistable_for_openai_conversation(item: TResponseInputItem) -> bool:
     return not item.get("id") and not item.get("encrypted_content")
 
 
-def _omit_boundary_assistant_message_ids(history: list[TResponseInputItem]) -> None:
-    """Replay the leading response fragment by value if the window cut off its reasoning."""
+# Leading response-fragment item types whose ``id`` is optional in the Responses input
+# schema, so the fragment can be replayed by value when the window cut off its reasoning.
+# Every other item type requires its server-assigned id as input and must keep it.
+_BOUNDARY_FRAGMENT_VALUE_REPLAY_TYPES: frozenset[str] = frozenset(
+    {"message", "function_call", "custom_tool_call"}
+)
+
+
+def _replay_boundary_response_fragment_by_value(history: list[TResponseInputItem]) -> None:
+    """Replay the leading response fragment by value if the window cut off its reasoning.
+
+    A limited window can start inside a stored response, after the reasoning item that the
+    Responses API requires the rest of that response to reference. An item replayed by its
+    server id is then rejected as "provided without its required 'reasoning' item", so the
+    fragment drops the id and is sent as plain input instead. Only item types that the input
+    schema accepts without an id are replayed that way; a type whose input form requires its
+    server id keeps it, because dropping it would replace that rejection with an invalid
+    request. ``FAKE_RESPONSES_ID`` is the SDK's placeholder for providers that assign no item
+    id, so it is not a server identity to repair.
+    """
     for item in history:
         if item.get("type") == "reasoning" or item.get("role") in ("user", "developer", "system"):
             break
-        if item.get("type") == "message" and item.get("role") == "assistant":
-            message = cast(dict[str, Any], item)
-            item_id = message.get("id")
-            if isinstance(item_id, str) and item_id.startswith("msg_"):
-                del message["id"]
+        if item.get("type") not in _BOUNDARY_FRAGMENT_VALUE_REPLAY_TYPES:
+            continue
+        fragment_item = cast(dict[str, Any], item)
+        item_id = fragment_item.get("id")
+        if isinstance(item_id, str) and item_id != FAKE_RESPONSES_ID:
+            del fragment_item["id"]
 
 
 def _sanitize_openai_conversation_history_items_for_model_input(

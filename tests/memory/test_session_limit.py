@@ -121,6 +121,199 @@ async def test_session_limit_drops_unmatched_history_function_call_output(runner
         session.close()
 
 
+@pytest.mark.parametrize(
+    ("call_item", "call_output_item"),
+    [
+        (
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": "{}",
+            },
+            {"type": "function_call_output", "call_id": "call_1", "output": "sunny"},
+        ),
+        (
+            {
+                "type": "custom_tool_call",
+                "id": "ctc_1",
+                "call_id": "call_1",
+                "name": "run_code",
+                "input": "print(1)",
+            },
+            {"type": "custom_tool_call_output", "call_id": "call_1", "output": "1"},
+        ),
+    ],
+    ids=["function_call", "custom_tool_call"],
+)
+@pytest.mark.parametrize("runner_method", ["run", "run_sync", "run_streamed"])
+@pytest.mark.asyncio
+async def test_session_limit_replays_boundary_function_call_by_value(
+    runner_method, call_item, call_output_item
+):
+    """A window that starts inside a tool-calling response must not replay its call by id.
+
+    The excluded reasoning item is what the Responses API associates with the rest of that
+    response, so a boundary call sent with its server id is rejected as an item "provided
+    without its required 'reasoning' item". These call types accept an id-less input item.
+    """
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session = SQLiteSession("limit_tool_boundary", Path(temp_dir) / "test_limit_boundary.db")
+        history = cast(
+            list[TResponseInputItem],
+            [
+                {"role": "user", "content": "What is the weather?"},
+                {"type": "reasoning", "id": "rs_1", "summary": []},
+                call_item,
+                call_output_item,
+                {"type": "reasoning", "id": "rs_2", "summary": []},
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "It is sunny.", "annotations": []}],
+                },
+            ],
+        )
+        await session.add_items(history)
+
+        window = history[2:]
+        assert await session.get_items(limit=len(window)) == window
+
+        model = ScriptedModel()
+        model.enqueue([get_text_message("Tomorrow is sunny too.")])
+        agent = Agent(name="test", model=model)
+
+        await run_agent_async(
+            runner_method,
+            agent,
+            "What about tomorrow?",
+            session=session,
+            run_config=RunConfig(session_settings=SessionSettings(limit=len(window))),
+        )
+
+        boundary_call = dict(window[0])
+        assert boundary_call.pop("id") == call_item["id"]
+        assert model.calls[-1].input == [
+            boundary_call,
+            *window[1:],
+            {"role": "user", "content": "What about tomorrow?"},
+        ]
+        session.close()
+
+
+@pytest.mark.parametrize("runner_method", ["run", "run_sync", "run_streamed"])
+@pytest.mark.asyncio
+async def test_session_limit_keeps_boundary_approval_request_id(runner_method):
+    """A boundary approval request keeps the id its paired response points back at."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session = SQLiteSession("limit_approval_boundary", Path(temp_dir) / "test_limit_mcp.db")
+        history = cast(
+            list[TResponseInputItem],
+            [
+                {"role": "user", "content": "Search the docs."},
+                {"type": "reasoning", "id": "rs_1", "summary": []},
+                {
+                    "type": "mcp_approval_request",
+                    "id": "mcpr_1",
+                    "name": "search",
+                    "server_label": "docs",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "mcp_approval_response",
+                    "approval_request_id": "mcpr_1",
+                    "approve": True,
+                },
+                {"type": "reasoning", "id": "rs_2", "summary": []},
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Found it.", "annotations": []}],
+                },
+            ],
+        )
+        await session.add_items(history)
+
+        window = history[2:]
+        assert await session.get_items(limit=len(window)) == window
+
+        model = ScriptedModel()
+        model.enqueue([get_text_message("Anything else?")])
+        agent = Agent(name="test", model=model)
+
+        await run_agent_async(
+            runner_method,
+            agent,
+            "Search more.",
+            session=session,
+            run_config=RunConfig(session_settings=SessionSettings(limit=len(window))),
+        )
+
+        assert model.calls[-1].input == [
+            *window,
+            {"role": "user", "content": "Search more."},
+        ]
+        session.close()
+
+
+@pytest.mark.parametrize("runner_method", ["run", "run_sync", "run_streamed"])
+@pytest.mark.asyncio
+async def test_session_limit_keeps_boundary_web_search_call_id(runner_method):
+    """A boundary item whose input form requires an id keeps it.
+
+    Replaying a hosted call by value is not available: ``web_search_call`` requires its
+    server-assigned id in the Responses input schema, so a window that starts here still
+    fails the turn. The SDK must not trade that for a request the schema rejects outright.
+    """
+    with tempfile.TemporaryDirectory() as temp_dir:
+        session = SQLiteSession("limit_web_search_boundary", Path(temp_dir) / "test_limit_ws.db")
+        history = cast(
+            list[TResponseInputItem],
+            [
+                {"role": "user", "content": "Search the web."},
+                {"type": "reasoning", "id": "rs_1", "summary": []},
+                {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "completed",
+                    "action": {"type": "search", "query": "agents sdk"},
+                },
+                {"type": "reasoning", "id": "rs_2", "summary": []},
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Found it.", "annotations": []}],
+                },
+            ],
+        )
+        await session.add_items(history)
+
+        window = history[2:]
+        assert await session.get_items(limit=len(window)) == window
+
+        model = ScriptedModel()
+        model.enqueue([get_text_message("Anything else?")])
+        agent = Agent(name="test", model=model)
+
+        await run_agent_async(
+            runner_method,
+            agent,
+            "Search more.",
+            session=session,
+            run_config=RunConfig(session_settings=SessionSettings(limit=len(window))),
+        )
+
+        sent = model.calls[-1].input
+        assert sent[0] == window[0]
+        assert cast(dict, sent[0])["id"] == "ws_1"
+        assert sent == [*window, {"role": "user", "content": "Search more."}]
+        session.close()
+
+
 @pytest.mark.parametrize("runner_method", ["run", "run_sync", "run_streamed"])
 @pytest.mark.asyncio
 async def test_session_limit_zero(runner_method):
