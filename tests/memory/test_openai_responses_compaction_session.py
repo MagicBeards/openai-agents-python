@@ -136,6 +136,37 @@ async def test_compaction_replay_strips_created_by(history_source: str) -> None:
         underlying.close()
 
 
+@pytest.mark.asyncio
+async def test_limited_underlying_store_does_not_replay_orphan_function_call_output() -> None:
+    model = ScriptedModel()
+    agent = Agent(name="test", model=model)
+    underlying = SQLiteSession("limited-window", session_settings=SessionSettings(limit=2))
+    try:
+        await underlying.add_items(
+            [
+                {
+                    "type": "function_call",
+                    "call_id": "call_window",
+                    "name": "lookup",
+                    "arguments": "{}",
+                },
+                {"type": "function_call_output", "call_id": "call_window", "output": "ok"},
+                {"role": "user", "content": "question"},
+            ]
+        )
+        session = OpenAIResponsesCompactionSession("limited-window", underlying)
+
+        model.enqueue([get_text_message("done")])
+        await Runner.run(agent, "continue", session=session)
+
+        assert model.calls[-1].input == [
+            {"role": "user", "content": "question"},
+            {"role": "user", "content": "continue"},
+        ]
+    finally:
+        underlying.close()
+
+
 class TestIsOpenAIModelName:
     def test_gpt_models(self) -> None:
         assert is_openai_model_name("gpt-4o") is True
