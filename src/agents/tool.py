@@ -10,7 +10,7 @@ import math
 import typing
 import weakref
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, is_dataclass
 from enum import Enum
 from types import FunctionType, UnionType
 from typing import (
@@ -2504,6 +2504,34 @@ def _validate_function_tool_callable_annotations(
         )
 
 
+def _declared_class_docstring(cls: type) -> str | None:
+    """Return the docstring the callable class declares itself, if it declares one.
+
+    ``inspect.getdoc`` falls back to the first base class that has a docstring, and ``@dataclass``
+    and ``NamedTuple`` write a generated signature into ``__doc__``. Neither text describes the
+    tool the instance exposes, so the instance's ``__call__`` docstring has to win instead.
+    """
+    doc = cls.__dict__.get("__doc__")
+    if not isinstance(doc, str) or not doc.strip():
+        return None
+    generated = False
+    if is_dataclass(cls):
+        # Mirror the docstring ``@dataclass`` writes: the class name plus its signature, or the
+        # bare class name when the signature cannot be inspected.
+        try:
+            signature = str(inspect.signature(cls)).replace(" -> None", "")
+        except (TypeError, ValueError):
+            signature = ""
+        generated = doc == f"{cls.__name__}{signature}"
+    if not generated and issubclass(cls, tuple) and hasattr(cls, "_fields"):
+        # ``collections.namedtuple`` always writes ``<ClassName>(<field list>)``, and its text
+        # survives on a dataclass-decorated namedtuple class that already had a docstring.
+        generated = doc.startswith(f"{cls.__name__}(") and doc.endswith(")")
+    if generated:
+        return None
+    return inspect.cleandoc(doc)
+
+
 def _normalize_function_tool_callable(
     func: ToolFunction[...],
     docstring_style: DocstringStyle | None,
@@ -2606,7 +2634,7 @@ def _normalize_function_tool_callable(
         adapter_metadata.__doc__ = None
         class_description = None
     else:
-        class_doc = inspect.getdoc(type(func))
+        class_doc = _declared_class_docstring(type(func))
         call_doc = inspect.cleandoc(call_descriptor.__doc__) if call_descriptor.__doc__ else None
         adapter_metadata.__doc__ = call_doc or class_doc
         class_description = (

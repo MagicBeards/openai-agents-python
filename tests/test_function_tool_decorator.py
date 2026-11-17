@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import copy
 import dataclasses
 import functools
@@ -10,7 +11,7 @@ import operator
 import sys
 from collections.abc import Callable
 from types import ModuleType
-from typing import Annotated, Any, Generic, TypeVar, cast
+from typing import Annotated, Any, Generic, NamedTuple, TypeVar, cast
 
 import pytest
 from inline_snapshot import snapshot
@@ -523,6 +524,90 @@ def test_callable_object_combines_class_summary_with_call_parameter_docs() -> No
         "title": "Value",
         "type": "integer",
     }
+
+
+def test_callable_object_ignores_inherited_class_docstring() -> None:
+    class Base:
+        """Documentation that describes the base class, not this tool."""
+
+    class Documented(Base):
+        async def __call__(self, value: int) -> int:
+            """Double a value."""
+            return value * 2
+
+    class Undocumented(Base):
+        async def __call__(self, value: int) -> int:
+            return value * 2
+
+    assert function_tool(Documented()).description == "Double a value."
+    assert function_tool(Undocumented()).description == ""
+
+
+def test_callable_object_ignores_generated_class_docstring() -> None:
+    @dataclasses.dataclass
+    class DataclassCallable:
+        factor: int
+
+        async def __call__(self, value: int) -> int:
+            """Double a value."""
+            return value * self.factor
+
+    class NamedTupleCallable(NamedTuple):
+        factor: int
+
+        async def __call__(self, value: int) -> int:
+            """Double a value."""
+            return value * self.factor
+
+    assert function_tool(DataclassCallable(2)).description == "Double a value."
+    assert function_tool(NamedTupleCallable(2)).description == "Double a value."
+
+
+def test_callable_object_keeps_declared_class_docstring_on_generated_class_shapes() -> None:
+    @dataclasses.dataclass
+    class DataclassCallable:
+        """Configure a reusable multiplier."""
+
+        factor: int
+
+        async def __call__(self, value: int) -> int:
+            """Double a value."""
+            return value * self.factor
+
+    class NamedTupleCallable(NamedTuple):
+        """Configure a reusable multiplier."""
+
+        factor: int
+
+        async def __call__(self, value: int) -> int:
+            """Double a value."""
+            return value * self.factor
+
+    assert function_tool(DataclassCallable(2)).description == "Configure a reusable multiplier."
+    assert function_tool(NamedTupleCallable(2)).description == "Configure a reusable multiplier."
+
+
+def test_callable_object_ignores_generated_docstring_without_inspectable_signature() -> None:
+    @dataclasses.dataclass(init=False)
+    class DataclassCallable(dict):
+        async def __call__(self, value: int) -> int:
+            """Double a value."""
+            return value * 2
+
+    assert function_tool(DataclassCallable()).description == "Double a value."
+
+
+def test_callable_object_ignores_namedtuple_docstring_on_dataclass_class() -> None:
+    async def call(self: Any, value: int) -> int:
+        """Double a value."""
+        return value * 2
+
+    # ``collections.namedtuple`` writes ``Combo(factor,)`` and ``@dataclass`` keeps that text
+    # because the class already has a docstring, so neither generated form matches the other.
+    Combo = dataclasses.dataclass(init=False)(collections.namedtuple("Combo", ["factor"]))
+    Combo.__call__ = call
+
+    assert function_tool(Combo(2)).description == "Double a value."
 
 
 @pytest.mark.parametrize("class_name", ["Café", "A" * 65])
