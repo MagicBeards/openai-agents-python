@@ -26,16 +26,26 @@ def get_sentence_based_splitter(
         Returns:
             A tuple of the text to process and the remaining text buffer.
         """
-        sentences = re.split(r"(?<=[.!?])\s+", text_buffer.strip())
-        if len(sentences) >= 1:
-            combined_sentences = " ".join(sentences[:-1])
+        stripped_text = text_buffer.strip()
+        # CJK sentences end with a full-width terminator and are not followed by whitespace, so
+        # they need their own boundary that does not require a separator to match.
+        boundaries = list(re.finditer(r"(?<=[.!?])\s+|(?<=[。！？])\s*", stripped_text))
+        if boundaries:
+            last_boundary = boundaries[-1]
+            # Keep one space between the flushed sentences, as the previous single-space join of
+            # the split sentences did, while leaving CJK text without an added separator.
+            combined_sentences = re.sub(
+                r"(?<=[.!?])\s+", " ", stripped_text[: last_boundary.start()]
+            )
             if len(combined_sentences) >= min_sentence_length:
-                # Carry any trailing whitespace over to the remainder. It separates the text
-                # held back from the next streamed delta, and stripping it concatenates the
-                # next word onto the last one, so "He " followed by "arrived" is spoken as
-                # "Hearrived".
-                trailing_whitespace = text_buffer[len(text_buffer.rstrip()) :]
-                remaining_text_buffer = sentences[-1] + trailing_whitespace
+                remaining_text_buffer = stripped_text[last_boundary.end() :]
+                if remaining_text_buffer:
+                    # Carry any trailing whitespace over to the remainder. It separates the text
+                    # held back from the next streamed delta, and stripping it concatenates the
+                    # next word onto the last one, so "He " followed by "arrived" is spoken as
+                    # "Hearrived". With nothing held back it would only leave a whitespace-only
+                    # buffer, which is still synthesized at the end of the turn.
+                    remaining_text_buffer += text_buffer[len(text_buffer.rstrip()) :]
                 return combined_sentences, remaining_text_buffer
         return "", text_buffer
 

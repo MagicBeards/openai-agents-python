@@ -42,6 +42,56 @@ def test_streamed_text_is_spoken_without_losing_or_gluing_words(text: str, chunk
     assert " ".join(_stream(text, chunk_size)).split() == text.split()
 
 
+@pytest.mark.parametrize("chunk_size", [1, 3, 7])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "这是一个足够长的中文句子，可以切分开了。第二句话也足够长了，应该单独朗读。第三句",
+        "今日はとてもいい天気ですね、散歩しましょう。もう一つの文もここに",
+        "This is an English sentence。中文句子在这里，也应该被切分开来。And more English",
+    ],
+    ids=["chinese", "japanese", "mixed"],
+)
+def test_streamed_cjk_text_is_split_at_sentence_boundaries(text: str, chunk_size: int) -> None:
+    """CJK sentences end with `。！？` and are not followed by whitespace.
+
+    The whitespace requirement in the split pattern therefore never matched, so a CJK reply
+    was never split and the TTS call waited for the whole reply.
+    """
+    spoken = _stream(text, chunk_size)
+
+    assert len(spoken) > 1
+    assert [char for char in "".join(spoken) if not char.isspace()] == [
+        char for char in text if not char.isspace()
+    ]
+
+
+def test_cjk_split_respects_min_sentence_length() -> None:
+    """The minimum length applies to CJK text too, which has no word separators to rely on."""
+    split = get_sentence_based_splitter(20)
+
+    assert split("短句。下一句。") == ("", "短句。下一句。")
+
+    spoken, remaining = split("这是一个足够长的中文句子，可以切分开了。\n下一句还没有结束")
+
+    assert spoken == "这是一个足够长的中文句子，可以切分开了。"
+    assert remaining == "下一句还没有结束"
+
+
+def test_cjk_split_leaves_no_whitespace_only_remainder() -> None:
+    """A terminated CJK sentence flushes everything, so the buffer must end up empty.
+
+    A whitespace-only buffer is still truthy, so the turn-end path would synthesize it as an
+    extra TTS call.
+    """
+    split = get_sentence_based_splitter(20)
+
+    assert split("这是一个足够长的中文句子，可以切分开了。 ") == (
+        "这是一个足够长的中文句子，可以切分开了。",
+        "",
+    )
+
+
 def test_split_preserves_the_separator_before_the_next_delta() -> None:
     """The remainder must still end with the whitespace it was given."""
     split = get_sentence_based_splitter(20)
