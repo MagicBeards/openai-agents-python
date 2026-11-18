@@ -1298,18 +1298,34 @@ class RunContextWrapper(Generic[TContext]):
                 approval_entry.sticky_scope = (
                     scope_identity[1] if scope_identity is not None else None
                 )
-                approval_entry.approved = approve
-                approval_entry.rejected = [] if approve else True
-                if not approve:
+                if approve:
+                    approval_entry.approved = True
+                    # A sticky approval authorizes future calls, but it must not discard an exact
+                    # rejection of another call: the read path resolves a per-call rejection ahead
+                    # of the sticky default, so that decision was already made and still stands.
+                    # Only a sticky rejection is superseded here.
+                    if approval_entry.rejected is True:
+                        approval_entry.rejected = []
+                    approval_entry.sticky_rejection_message = None
+                    if isinstance(approval_entry.rejected, list) and approval_entry.rejected:
+                        still_rejected = set(approval_entry.rejected)
+                        approval_entry.rejection_messages = {
+                            rejected_call_id: message
+                            for rejected_call_id, message in (
+                                approval_entry.rejection_messages.items()
+                            )
+                            if rejected_call_id in still_rejected
+                        }
+                    else:
+                        approval_entry.rejection_messages.clear()
+                else:
                     approval_entry.approved = False
+                    approval_entry.rejected = True
                     if rejection_message is not None and call_id is not None:
                         approval_entry.rejection_messages[call_id] = rejection_message
                     elif call_id is not None:
                         self._clear_rejection_message(approval_entry, call_id)
                     approval_entry.sticky_rejection_message = rejection_message
-                else:
-                    approval_entry.rejection_messages.clear()
-                    approval_entry.sticky_rejection_message = None
                 continue
 
             opposite = approval_entry.rejected if approve else approval_entry.approved

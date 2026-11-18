@@ -740,3 +740,34 @@ def test_explicit_same_name_namespace_does_not_alias_to_bare_tool() -> None:
         )
         is True
     )
+
+
+def test_exact_rejection_survives_a_later_sticky_approval() -> None:
+    """An exact rejection outlives a sticky approval made afterwards for the same tool.
+
+    The mirror of ``test_hosted_mcp_exact_query_precedes_colliding_function_sticky_decision``:
+    there the exact decision comes second, here it comes first. Both orders have to resolve the
+    same way, because a per-call rejection is the narrower decision either way.
+    """
+    agent = Agent(name="test-agent")
+    context_wrapper = RunContextWrapper(context=None)
+    rejected_item = make_tool_approval_item(
+        agent,
+        call_id="rejected-call",
+        name="lookup_account",
+    )
+    approved_item = make_tool_approval_item(
+        agent,
+        call_id="approved-call",
+        name="lookup_account",
+    )
+
+    context_wrapper.reject_tool(rejected_item, rejection_message="do not run this")
+    context_wrapper.approve_tool(approved_item, always_approve=True)
+
+    assert context_wrapper.is_tool_approved("lookup_account", "rejected-call") is False
+    assert context_wrapper.get_rejection_message("lookup_account", "rejected-call") == (
+        "do not run this"
+    )
+    assert context_wrapper.is_tool_approved("lookup_account", "approved-call") is True
+    assert context_wrapper.is_tool_approved("lookup_account", "next-call") is True
