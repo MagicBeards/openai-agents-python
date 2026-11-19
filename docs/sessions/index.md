@@ -102,7 +102,10 @@ Use this when you need custom pruning, reordering, or selective inclusion of his
 Use [`SessionSettings`][agents.memory.SessionSettings] to control how much history is fetched before each run.
 
 -   `SessionSettings(limit=None)` (default): retrieve all available session items
--   `SessionSettings(limit=N)`: retrieve only the most recent `N` items
+-   `SessionSettings(limit=N)`: retrieve at most the most recent `N` items. The window never
+    grows past `N` to complete a cut response: if `N` would start inside a stored response, the
+    window starts at that response's first intact item instead, so it can return fewer than `N`
+    items. Size `N` as an upper bound on cost and latency, not as an exact count.
 
 You can apply this per run via [`RunConfig.session_settings`][agents.run.RunConfig.session_settings]:
 

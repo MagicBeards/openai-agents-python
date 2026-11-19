@@ -261,12 +261,13 @@ async def test_session_limit_keeps_boundary_approval_request_id(runner_method):
 
 @pytest.mark.parametrize("runner_method", ["run", "run_sync", "run_streamed"])
 @pytest.mark.asyncio
-async def test_session_limit_keeps_boundary_web_search_call_id(runner_method):
-    """A boundary item whose input form requires an id keeps it.
+async def test_session_limit_drops_a_boundary_hosted_call(runner_method):
+    """A boundary item whose input form requires an id is dropped, not replayed.
 
-    Replaying a hosted call by value is not available: ``web_search_call`` requires its
-    server-assigned id in the Responses input schema, so a window that starts here still
-    fails the turn. The SDK must not trade that for a request the schema rejects outright.
+    ``web_search_call`` requires its server-assigned id in the Responses input schema, so it
+    cannot be replayed by value: dropping the id would replace the "missing reasoning item"
+    rejection with a request the schema rejects outright. The window therefore starts at the
+    next intact item, which means it returns fewer than ``limit`` items.
     """
     with tempfile.TemporaryDirectory() as temp_dir:
         session = SQLiteSession("limit_web_search_boundary", Path(temp_dir) / "test_limit_ws.db")
@@ -308,9 +309,8 @@ async def test_session_limit_keeps_boundary_web_search_call_id(runner_method):
         )
 
         sent = model.calls[-1].input
-        assert sent[0] == window[0]
-        assert cast(dict, sent[0])["id"] == "ws_1"
-        assert sent == [*window, {"role": "user", "content": "Search more."}]
+        assert sent == [*window[1:], {"role": "user", "content": "Search more."}]
+        assert all(cast(dict, item).get("type") != "web_search_call" for item in sent)
         session.close()
 
 

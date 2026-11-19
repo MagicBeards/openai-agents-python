@@ -483,6 +483,16 @@ async def prepare_input_with_session(
         ensure_input_item_format(item) for item in ItemHelpers.input_to_new_input_list(input)
     ]
 
+    # Repair a window that starts inside a stored response before anything is built from it:
+    # the repair can drop leading items, and every index and copy below has to see the final
+    # list. `session_input_callback` owns its own boundary, so it is excluded.
+    if (
+        session_input_callback is None
+        and resolved_settings.limit is not None
+        and len(converted_history) == resolved_settings.limit
+    ):
+        _repair_boundary_response_fragment(converted_history)
+
     prune_history_indexes: set[int] = set()
     output_pruning_indexes: set[int] | None = None
 
@@ -497,8 +507,6 @@ async def prepare_input_with_session(
             prune_history_indexes = set(range(len(converted_history)))
             if session_input_callback is None and resolved_settings.limit is not None:
                 output_pruning_indexes = set(prune_history_indexes)
-                if len(converted_history) == resolved_settings.limit:
-                    _replay_boundary_response_fragment_by_value(converted_history)
     else:
         if not callable(session_input_callback):
             raise UserError(
@@ -1846,28 +1854,61 @@ _BOUNDARY_FRAGMENT_VALUE_REPLAY_TYPES: frozenset[str] = frozenset(
     {"message", "function_call", "custom_tool_call"}
 )
 
+# Model-produced item types whose input form requires the server-assigned ``id``, so they
+# cannot be replayed by value at a window boundary. They are dropped instead, which shortens
+# the window rather than sending a request the input schema rejects.
+_BOUNDARY_FRAGMENT_DROP_TYPES: frozenset[str] = frozenset(
+    {
+        "web_search_call",
+        "file_search_call",
+        "computer_call",
+        "code_interpreter_call",
+        "image_generation_call",
+        "local_shell_call",
+        "mcp_list_tools",
+        "mcp_call",
+        "program",
+        "program_output",
+    }
+)
 
-def _replay_boundary_response_fragment_by_value(history: list[TResponseInputItem]) -> None:
-    """Replay the leading response fragment by value if the window cut off its reasoning.
 
-    A limited window can start inside a stored response, after the reasoning item that the
-    Responses API requires the rest of that response to reference. An item replayed by its
-    server id is then rejected as "provided without its required 'reasoning' item", so the
-    fragment drops the id and is sent as plain input instead. Only item types that the input
-    schema accepts without an id are replayed that way; a type whose input form requires its
-    server id keeps it, because dropping it would replace that rejection with an invalid
-    request. ``FAKE_RESPONSES_ID`` is the SDK's placeholder for providers that assign no item
-    id, so it is not a server identity to repair.
+def _repair_boundary_response_fragment(history: list[TResponseInputItem]) -> None:
+    """Repair a window that starts inside a stored response, after its reasoning item.
+
+    The Responses API rejects the rest of such a response when it is replayed by its server
+    id, because that id refers to a response whose reasoning item is not in the window. Two
+    repairs are possible, chosen by whether the input schema accepts the item without an id:
+
+    - ``message``, ``function_call`` and ``custom_tool_call`` declare ``id`` as optional, so
+      the item stays and is replayed by value.
+    - the hosted and program types require their server ``id``, so they cannot be replayed by
+      value; replaying them without it would replace that rejection with an invalid request.
+      They are dropped, and the window starts later than the requested ``limit``.
+
+    Dropping is confined to those types so that a window which starts at a user-side item,
+    such as a ``function_call_output``, is never shortened. ``limit`` is a bound, not a
+    target: a window that would start inside a response starts at that response's first
+    intact item instead. ``FAKE_RESPONSES_ID`` is the SDK's placeholder for providers that
+    assign no item id, so it is not a server identity to repair.
     """
-    for item in history:
+    index = 0
+    while index < len(history):
+        item = history[index]
         if item.get("type") == "reasoning" or item.get("role") in ("user", "developer", "system"):
             break
-        if item.get("type") not in _BOUNDARY_FRAGMENT_VALUE_REPLAY_TYPES:
+        item_type = item.get("type")
+        if item_type in _BOUNDARY_FRAGMENT_DROP_TYPES:
+            del history[index]
+            continue
+        if item_type not in _BOUNDARY_FRAGMENT_VALUE_REPLAY_TYPES:
+            index += 1
             continue
         fragment_item = cast(dict[str, Any], item)
         item_id = fragment_item.get("id")
         if isinstance(item_id, str) and item_id != FAKE_RESPONSES_ID:
             del fragment_item["id"]
+        index += 1
 
 
 def _sanitize_openai_conversation_history_items_for_model_input(
